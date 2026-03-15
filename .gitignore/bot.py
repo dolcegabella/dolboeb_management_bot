@@ -7,6 +7,7 @@ import easyocr
 import shutil
 import time
 import re
+import threading
 
 # Токен бота
 TOKEN = '8697524461:AAFs8il54OBoGjs8VnrvoQGkgplvxuYUDZ8'
@@ -24,8 +25,11 @@ print("Готов к работе!")
 
 EXCEL_FILE = 'ебанаты (кроме кисули).xlsx'
 
-# Слова для пропуска строк
-SKIP_WORDS = ['участник', 'поиск', 'организатор', 'конференции', 'участники']
+# Слова для пропуска строк (приводим к нижнему регистру для надежности)
+SKIP_WORDS = [word.lower() for word in ['участник', 'поиск', 'организатор', 'конференции', 'участники', 'Губернаторов', "Тимофеева", "Горбатенко", "Никифорова", "Тееленко", "Крылов"]]
+
+# Словарь для хранения временных данных медиа-групп
+media_groups = {}
 
 def make_backup():
     """Создает резервную копию Excel файла"""
@@ -46,9 +50,15 @@ def clean_text(text):
     text = text.strip()
     return text
 
+def remove_digits(text):
+    """
+    Удаляет все цифры из текста
+    """
+    return re.sub(r'\d+', '', text)
+
 def filter_short_words(text):
     """
-    Фильтрует слова, оставляя только те, что длиннее 3 символов (минимум 4 символа)
+    Фильтрует слова, оставляя только те, что длиннее 2 символов (минимум 3 символа)
     """
     if not text:
         return text
@@ -56,8 +66,8 @@ def filter_short_words(text):
     # Разбиваем на слова
     words = text.split()
     
-    # Фильтруем слова (оставляем только те, где > 3 символов, т.е. минимум 4)
-    filtered_words = [word for word in words if len(word) > 3]
+    # Фильтруем слова (оставляем только те, где > 2 символов, т.е. минимум 3)
+    filtered_words = [word for word in words if len(word) > 2]
     
     # Соединяем обратно через пробелы
     return ' '.join(filtered_words)
@@ -88,10 +98,51 @@ def should_skip_line(line_text):
     Проверяет, нужно ли пропустить строку
     """
     line_lower = line_text.lower()
+    
+    # ВАЖНО: строки с этими фамилиями НИКОГДА не пропускаем
+    important_names = ['ситдикова', 'безруков', 'мадина']
+    for name in important_names:
+        if name in line_lower:
+            return False
+    
+    # Для остальных строк проверяем стоп-слова
     for word in SKIP_WORDS:
         if word in line_lower:
+            print(f"Пропущена строка (содержит '{word}'): {line_text}")
             return True
     return False
+
+def apply_special_rules(text):
+    """
+    Применяет специальные правила для определенных имен
+    """
+    if not text:
+        return text
+    
+    original_text = text
+    print(f"🔍 ПРИМЕНЯЮ ПРАВИЛА К: '{text}'")
+    
+    # ПРАВИЛО 1: Ситдикова - просто удаляем (попандо)
+    if 'Ситдикова' in text or 'ситдикова' in text or 'СИТДИКОВА' in text:
+        # Убираем (попандо) если есть
+        text = re.sub(r'\(?попандо\)?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\(?popando\)?', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        print(f"✅ ПРАВИЛО СИТДИКОВА (удален попандо): '{original_text}' -> '{text}'")
+    
+    # ПРАВИЛО 2: Мадина -> Мадина Задворочнова
+    if 'Мадина' in text or 'мадина' in text or 'МАДИНА' in text:
+        if 'Задворочнова' not in text and 'задворочнова' not in text:
+            text = text + ' Задворочнова'
+            print(f"✅ ПРАВИЛО МАДИНА: '{original_text}' -> '{text}'")
+    
+    # ПРАВИЛО 3: Безруков -> убираем Романович
+    if 'Безруков' in text or 'безруков' in text or 'БЕЗРУКОВ' in text:
+        text = re.sub(r'романович', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s+', ' ', text).strip()
+        print(f"✅ ПРАВИЛО БЕЗРУКОВ: '{original_text}' -> '{text}'")
+    
+    return text
 
 def extract_names_from_image(image_path):
     """
@@ -122,6 +173,11 @@ def extract_names_from_image(image_path):
     
     if not results:
         return []
+    
+    # Выводим все распознанные тексты для отладки
+    print("🔍 OCR РАСПОЗНАЛ:")
+    for (bbox, text, confidence) in results:
+        print(f"   Текст: '{text}', уверенность: {confidence:.2f}")
     
     # Группируем по строкам на основе координат
     words_with_pos = []
@@ -179,6 +235,10 @@ def extract_names_from_image(image_path):
         line_text = clean_text(line_text)
         lines.append(line_text)
     
+    print("🔍 СФОРМИРОВАННЫЕ СТРОКИ:")
+    for i, line in enumerate(lines):
+        print(f"   Строка {i+1}: '{line}'")
+    
     # Обрабатываем каждую строку
     names = []
     
@@ -187,18 +247,32 @@ def extract_names_from_image(image_path):
         if should_skip_line(line):
             continue
         
-        # Делаем первую букву каждого слова заглавной
-        formatted_line = capitalize_words(line)
+        print(f"🔍 ОБРАБАТЫВАЮ СТРОКУ: '{line}'")
         
-        # Фильтруем короткие слова (удаляем слова <= 3 символов, оставляем минимум 4)
-        formatted_line = filter_short_words(formatted_line)
+        # ШАГ 1: Удаляем цифры из строки
+        line_without_digits = remove_digits(line)
+        if line_without_digits != line:
+            print(f"   После удаления цифр: '{line_without_digits}'")
         
-        # Дополнительная очистка
+        # ШАГ 2: Применяем специальные правила (Ситдикова, Мадина, Безруков)
+        line_with_rules = apply_special_rules(line_without_digits)
+        
+        # ШАГ 3: Делаем первую букву каждого слова заглавной
+        formatted_line = capitalize_words(line_with_rules)
+        
+        # ШАГ 4: Очищаем от лишних пробелов
         formatted_line = clean_text(formatted_line)
         
+        # ШАГ 5: Фильтруем короткие слова (оставляем только слова >= 3 букв)
+        filtered_line = filter_short_words(formatted_line)
+        print(f"   После фильтрации коротких: '{filtered_line}'")
+        
         # Добавляем только непустые строки
-        if formatted_line and len(formatted_line) >= 2:
-            names.append(formatted_line)
+        if filtered_line and len(filtered_line) >= 2:
+            names.append(filtered_line)
+            print(f"✅ ДОБАВЛЕНО ИМЯ: '{filtered_line}'")
+        else:
+            print(f"❌ СТРОКА ОТБРОШЕНА (пустая или слишком короткая)")
     
     return names
 
@@ -211,14 +285,81 @@ def add_names_to_excel(names_list):
     
     while attempt < max_attempts:
         try:
-            # Текущая дата для заголовка столбца
-            today = datetime.now().strftime("%d.%m.%Y")
+            # Текущая дата для заголовка столбца в формате ДД-ММ-ГГГГ
+            today = datetime.now().strftime("%d-%m-%Y")
             
             # Читаем существующий файл или создаем новый
             if os.path.exists(EXCEL_FILE):
-                df = pd.read_excel(EXCEL_FILE)
+                # Читаем файл, явно указывая, что заголовки - строки
+                df = pd.read_excel(EXCEL_FILE, dtype=str)
                 print(f"Текущий DataFrame:\n{df}")
-                print(f"Индекс DataFrame: {df.index.tolist()}")
+                print(f"Заголовки столбцов: {df.columns.tolist()}")
+                
+                # Сохраняем порядок столбцов
+                original_columns_order = df.columns.tolist()
+                print(f"Исходный порядок столбцов: {original_columns_order}")
+                
+                # Приводим все существующие заголовки к строковому формату ДД-ММ-ГГГГ
+                new_columns = {}
+                for col in df.columns:
+                    col_str = str(col).strip()
+                    
+                    # Пробуем распарсить как дату в разных форматах
+                    try:
+                        # Проверяем формат ДД.ММ.ГГГГ
+                        if re.match(r'^\d{2}\.\d{2}\.\d{4}$', col_str):
+                            date_obj = datetime.strptime(col_str, "%d.%m.%Y")
+                            new_col_name = date_obj.strftime("%d-%m-%Y")
+                            new_columns[new_col_name] = df[col].tolist()
+                        # Проверяем формат ГГГГ-ММ-ДД
+                        elif re.match(r'^\d{4}-\d{2}-\d{2}', col_str):
+                            # Извлекаем только дату без времени
+                            date_part = col_str.split()[0] if ' ' in col_str else col_str
+                            date_obj = datetime.strptime(date_part, "%Y-%m-%d")
+                            new_col_name = date_obj.strftime("%d-%m-%Y")
+                            new_columns[new_col_name] = df[col].tolist()
+                        # Проверяем числовой формат (например 5.0, 5)
+                        elif col_str.replace('.', '').isdigit():
+                            # Пробуем интерпретировать как дату Excel
+                            try:
+                                # Excel даты - это числа, где 1 = 01.01.1900
+                                excel_date = float(col_str)
+                                if excel_date > 40000:  # Примерно 2009 год
+                                    date_obj = datetime.fromordinal(datetime(1900, 1, 1).toordinal() + int(excel_date) - 2)
+                                    new_col_name = date_obj.strftime("%d-%m-%Y")
+                                    new_columns[new_col_name] = df[col].tolist()
+                                else:
+                                    new_columns[col_str] = df[col].tolist()
+                            except:
+                                new_columns[col_str] = df[col].tolist()
+                        else:
+                            new_columns[col_str] = df[col].tolist()
+                    except Exception as e:
+                        print(f"Ошибка при обработке колонки {col_str}: {e}")
+                        new_columns[col_str] = df[col].tolist()
+                
+                # Находим максимальную длину среди всех столбцов
+                max_length = max(len(values) for values in new_columns.values())
+                
+                # Выравниваем все столбцы до максимальной длины
+                for col_name in new_columns:
+                    current_length = len(new_columns[col_name])
+                    if current_length < max_length:
+                        new_columns[col_name] = new_columns[col_name] + [None] * (max_length - current_length)
+                
+                # Создаем новый DataFrame с конвертированными заголовками
+                df = pd.DataFrame(new_columns)
+                
+                # Восстанавливаем порядок столбцов (только те, что были)
+                existing_columns = [col for col in original_columns_order if col in df.columns]
+                other_columns = [col for col in df.columns if col not in original_columns_order]
+                
+                # Новый порядок: сначала существующие в исходном порядке, потом новые
+                new_order = existing_columns + other_columns
+                df = df[new_order]
+                
+                print(f"Заголовки после конвертации: {df.columns.tolist()}")
+                print(f"Новый порядок столбцов: {new_order}")
                 
                 # Проверяем, есть ли уже столбец с сегодняшней датой
                 if today in df.columns:
@@ -226,7 +367,7 @@ def add_names_to_excel(names_list):
                     print(f"Столбец {today} уже существует")
                     
                     # Получаем существующие имена за сегодня (убираем NaN)
-                    existing_today_names = df[today].dropna().tolist()
+                    existing_today_names = [x for x in df[today].tolist() if pd.notna(x)]
                     print(f"Существующие имена сегодня ({len(existing_today_names)}): {existing_today_names}")
                     print(f"Новые имена с фото ({len(names_list)}): {names_list}")
                     
@@ -242,24 +383,29 @@ def add_names_to_excel(names_list):
                         # Объединяем существующие и новые имена за сегодня
                         all_today_names = existing_today_names + new_names_today
                         
-                        # Создаем новый DataFrame с правильной структурой
-                        # Сохраняем все остальные столбцы
-                        other_columns = {}
+                        # Сохраняем все столбцы как списки
+                        all_data = {}
                         for col in df.columns:
                             if col != today:
-                                other_columns[col] = df[col].tolist()
+                                all_data[col] = df[col].tolist()
                         
-                        # Создаем новый DataFrame с обновленным столбцом
-                        new_df = pd.DataFrame({
-                            today: all_today_names
-                        })
+                        # Добавляем обновленный today
+                        all_data[today] = all_today_names
                         
-                        # Добавляем остальные столбцы
-                        for col_name, col_values in other_columns.items():
-                            # Приводим к одинаковой длине
-                            max_len = max(len(new_df), len(col_values))
-                            padded_values = col_values + [None] * (max_len - len(col_values))
-                            new_df[col_name] = padded_values[:max_len]
+                        # Находим максимальную длину
+                        max_len = max(len(values) for values in all_data.values())
+                        
+                        # Выравниваем все столбцы
+                        for col_name in all_data:
+                            current_len = len(all_data[col_name])
+                            if current_len < max_len:
+                                all_data[col_name] = all_data[col_name] + [None] * (max_len - current_len)
+                        
+                        # Создаем новый DataFrame
+                        new_df = pd.DataFrame(all_data)
+                        
+                        # Восстанавливаем порядок столбцов
+                        new_df = new_df[df.columns.tolist()]
                         
                         df = new_df
                         added_count = len(new_names_today)
@@ -279,23 +425,30 @@ def add_names_to_excel(names_list):
                             seen.add(name)
                             unique_new_names.append(name)
                     
-                    # Приводим все столбцы к одинаковой длине
-                    max_len = max(len(df), len(unique_new_names))
-                    
-                    # Создаем новый DataFrame с правильной длиной
-                    new_df = pd.DataFrame()
-                    
-                    # Копируем существующие столбцы с паддингом
+                    # Сохраняем все существующие столбцы как списки
+                    all_data = {}
                     for col in df.columns:
-                        col_values = df[col].tolist()
-                        padded_values = col_values + [None] * (max_len - len(col_values))
-                        new_df[col] = padded_values[:max_len]
+                        all_data[col] = df[col].tolist()
                     
                     # Добавляем новый столбец
-                    new_column = unique_new_names + [None] * (max_len - len(unique_new_names))
-                    new_df[today] = new_column
+                    all_data[today] = unique_new_names
                     
-                    df = new_df
+                    # Находим максимальную длину
+                    max_len = max(len(values) for values in all_data.values())
+                    
+                    # Выравниваем все столбцы
+                    for col_name in all_data:
+                        current_len = len(all_data[col_name])
+                        if current_len < max_len:
+                            all_data[col_name] = all_data[col_name] + [None] * (max_len - current_len)
+                    
+                    # Создаем новый DataFrame
+                    new_df = pd.DataFrame(all_data)
+                    
+                    # Восстанавливаем порядок: существующие + новый в конец
+                    new_order = df.columns.tolist() + [today]
+                    df = new_df[new_order]
+                    
                     added_count = len(unique_new_names)
                     print(f"Добавлено новых имен в новый столбец: {added_count}")
             else:
@@ -319,15 +472,16 @@ def add_names_to_excel(names_list):
             
             # Сохраняем файл
             print(f"Сохраняем файл...")
-            print(f"Итоговый DataFrame:\n{df}")
+            print(f"Итоговый порядок столбцов: {df.columns.tolist()}")
             df.to_excel(EXCEL_FILE, index=False)
             
             # Проверяем, сохранилось ли
             if os.path.exists(EXCEL_FILE):
-                check_df = pd.read_excel(EXCEL_FILE)
+                check_df = pd.read_excel(EXCEL_FILE, dtype=str)
                 print(f"Проверка сохранения - прочитано:\n{check_df}")
+                print(f"Заголовки столбцов: {check_df.columns.tolist()}")
                 if today in check_df.columns:
-                    saved_names = check_df[today].dropna().tolist()
+                    saved_names = [x for x in check_df[today].tolist() if pd.notna(x)]
                     print(f"Количество записей в столбце {today}: {len(saved_names)}")
                     print(f"Сохраненные имена: {saved_names}")
             
@@ -345,7 +499,7 @@ def add_names_to_excel(names_list):
             import traceback
             traceback.print_exc()
             raise e
-
+        
 def remove_duplicates_from_all_days():
     """
     Удаляет дубликаты ВНУТРИ каждого дня (столбца)
@@ -416,7 +570,7 @@ def send_welcome(message):
     total_days, total_names, unique_names = get_table_stats()
     bot.reply_to(message, 
         f"👋 Привет! Я бот для упрощения жизни самой лучшей кисы\n\n"
-        f"📸 Отправляй скрины участников конференции по одному в сообщении, дожидаясь формирования таблицы\n\n"
+        f"📸 Отправляй скрины участников конференции (можно несколько фото в одном сообщении!)\n\n"
         f"📊 Статистика:\n"
         f"• Всего дней: {total_days}\n"
         f"• Всего записей: {total_names}\n"
@@ -424,27 +578,214 @@ def send_welcome(message):
         f"Команды:\n"
         f"/debug - показывает содержимое актуальной таблицы\n"
         f"/remove_duplicates - удаляет дубликаты\n"
-        f"/help - показывает инструкцию по использованию бота"
+        f"/help - показывает инструкцию по использованию бота\n"
+        f"/delete_today - удаляет столбец с сегодняшней датой"
     )
+
+@bot.message_handler(commands=['delete_today'])
+def handle_delete_today(message):
+    """Удаляет столбец с сегодняшней датой"""
+    try:
+        # Текущая дата в формате ДД-ММ-ГГГГ
+        today = datetime.now().strftime("%d-%m-%Y")
+        
+        processing_msg = bot.reply_to(message, f"🔄 Проверяю наличие столбца {today}...")
+        
+        if not os.path.exists(EXCEL_FILE):
+            bot.edit_message_text(
+                "❌ Файл не найден",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        # Читаем файл
+        df = pd.read_excel(EXCEL_FILE, dtype=str)
+        
+        if df.empty or len(df.columns) == 0:
+            bot.edit_message_text(
+                "❌ В файле нет данных",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        # Проверяем, есть ли сегодняшний столбец
+        if today not in df.columns:
+            bot.edit_message_text(
+                f"❌ Столбец с датой {today} не найден",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        # Получаем количество записей в сегодняшнем столбце
+        names_count = df[today].dropna().count()
+        column_position = list(df.columns).index(today) + 1  # +1 для человеко-читаемого формата
+        
+        # Создаем клавиатуру для подтверждения
+        from telebot import types
+        markup = types.InlineKeyboardMarkup()
+        btn_yes = types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_today_{today}")
+        btn_no = types.InlineKeyboardButton("❌ Нет, отмена", callback_data="cancel_delete")
+        markup.add(btn_yes, btn_no)
+        
+        bot.edit_message_text(
+            f"⚠️ ВНИМАНИЕ!\n\n"
+            f"Вы собираетесь удалить сегодняшний столбец:\n"
+            f"📅 {today}\n"
+            f"📍 Позиция: столбец {column_position}\n"
+            f"📊 Записей в столбце: {names_count}\n\n"
+            f"Это действие нельзя отменить без резервной копии.\n"
+            f"Подтвердите удаление:",
+            chat_id=message.chat.id,
+            message_id=processing_msg.message_id,
+            reply_markup=markup
+        )
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+        print(f"Ошибка в handle_delete_today: {e}")
+        import traceback
+        traceback.print_exc()
+
+@bot.callback_query_handler(func=lambda call: True)
+def handle_callback(call):
+    """Обработчик нажатий на кнопки"""
+    try:
+        if call.data == "cancel_delete":
+            bot.edit_message_text(
+                "✅ Удаление отменено",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+            bot.answer_callback_query(call.id, "Отменено")
+            
+        elif call.data.startswith("confirm_delete_today_"):
+            today = call.data.replace("confirm_delete_today_", "")
+            
+            bot.edit_message_text(
+                f"🔄 Удаляю столбец {today}...",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+            
+            # Создаем резервную копию перед удалением
+            backup_path = make_backup()
+            
+            # Читаем файл
+            df = pd.read_excel(EXCEL_FILE, dtype=str)
+            
+            # Удаляем сегодняшний столбец
+            df = df.drop(columns=[today])
+            
+            # Сохраняем файл
+            df.to_excel(EXCEL_FILE, index=False)
+            
+            # Получаем обновленную статистику
+            total_days, total_names, unique_names = get_table_stats()
+            
+            # Формируем сообщение о результате
+            backup_info = f"\n💾 Резервная копия: {backup_path}" if backup_path else "\n⚠️ Резервная копия не создана"
+            
+            bot.edit_message_text(
+                f"✅ Столбец {today} успешно удален!\n\n"
+                f"📊 Текущая статистика:\n"
+                f"• Всего дней: {total_days}\n"
+                f"• Всего записей: {total_names}\n"
+                f"• Уникальных имен: {unique_names}{backup_info}",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id
+            )
+            
+            # Отправляем обновленный файл
+            with open(EXCEL_FILE, 'rb') as file:
+                bot.send_document(call.message.chat.id, file)
+            
+            bot.answer_callback_query(call.id, "Столбец удален")
+            
+    except Exception as e:
+        bot.answer_callback_query(call.id, f"Ошибка: {str(e)}")
+        bot.edit_message_text(
+            f"❌ Ошибка при удалении: {str(e)}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id
+        )
+        print(f"Ошибка в handle_callback: {e}")
+        import traceback
+        traceback.print_exc()
+
+# Команда для быстрого удаления без подтверждения (для разработчика)
+@bot.message_handler(commands=['force_delete_today'])
+def handle_force_delete_today(message):
+    """Принудительно удаляет сегодняшний столбец без подтверждения (только для разработчика)"""
+    try:
+        today = datetime.now().strftime("%d-%m-%Y")
+        
+        processing_msg = bot.reply_to(message, f"🔄 Принудительно удаляю столбец {today}...")
+        
+        if not os.path.exists(EXCEL_FILE):
+            bot.edit_message_text(
+                "❌ Файл не найден",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        df = pd.read_excel(EXCEL_FILE, dtype=str)
+        
+        if today not in df.columns:
+            bot.edit_message_text(
+                f"❌ Столбец {today} не найден",
+                chat_id=message.chat.id,
+                message_id=processing_msg.message_id
+            )
+            return
+        
+        # Создаем резервную копию
+        backup_path = make_backup()
+        
+        # Удаляем столбец
+        df = df.drop(columns=[today])
+        df.to_excel(EXCEL_FILE, index=False)
+        
+        total_days, total_names, unique_names = get_table_stats()
+        
+        bot.edit_message_text(
+            f"✅ Столбец {today} принудительно удален!\n\n"
+            f"📊 Статистика:\n"
+            f"• Всего дней: {total_days}\n"
+            f"• Всего записей: {total_names}\n"
+            f"• Уникальных имен: {unique_names}",
+            chat_id=message.chat.id,
+            message_id=processing_msg.message_id
+        )
+        
+        with open(EXCEL_FILE, 'rb') as file:
+            bot.send_document(message.chat.id, file)
+            
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
 
 @bot.message_handler(commands=['help'])
 def send_help(message):
     bot.reply_to(message,
         "🤖 Как работает бот:\n\n"
-        "1. Отправляете фото со списком участников\n"
+        "1. Отправляете фото со списком участников (можно несколько в одном сообщении)\n"
         "2. Бот распознает текст\n"
-        "3. 🔥 ВАЖНО: удаляются слова короче 4 символов\n"
-        "4. 📅 КАЖДЫЙ ДЕНЬ - НОВЫЙ СТОЛБЕЦ\n"
-        "5. Внутри одного дня дубликаты НЕ добавляются\n\n"
+        "3. 🔥 ВАЖНО: удаляются слова короче 3 символов\n"
+        "4. Удаляются цифры из строк\n"
+        "5. 📅 КАЖДЫЙ ДЕНЬ - НОВЫЙ СТОЛБЕЦ\n"
+        "6. Внутри одного дня дубликаты НЕ добавляются\n\n"
         "📋 Пример:\n"
         "• Первое фото сегодня: Иван Петров, Анна Смирнова → столбец A\n"
         "• Второе фото сегодня: Иван Петров, Петр Иванов → добавится только Петр Иванов в столбец A\n"
         "• Завтра: Иван Петров → новый столбец B\n\n"
         "Команды:\n"
+        "/help - показывает инструкцию по использованию бота\n"
         "/debug - показывает содержимое актуальной таблицы\n"
         "/remove_duplicates - удаляет дубликаты\n"
-        "/help - показывает инструкцию по использованию бота\n\n"
-        "позже реализую команду, очищающую столбец по указанной дате"
+        "/delete_today - удаляет столбец с сегодняшней датой"
     )
 
 @bot.message_handler(commands=['debug'])
@@ -504,13 +845,215 @@ def handle_remove_duplicates(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {str(e)}")
 
+# ========== ЕДИНСТВЕННЫЙ ОБРАБОТЧИК ФОТО ==========
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     try:
+        # Проверяем, является ли фото частью медиа-группы (альбома)
         if message.media_group_id:
-            bot.reply_to(message, "❌ Отправляй только ОДНО фото")
+            group_id = message.media_group_id
+            
+            # Если это первое фото в группе, создаем запись
+            if group_id not in media_groups:
+                media_groups[group_id] = {
+                    'photos': [],
+                    'message': None,
+                    'chat_id': message.chat.id,
+                    'processing': False,
+                    'timer_started': False
+                }
+            
+            # Добавляем фото в группу
+            media_groups[group_id]['photos'].append(message)
+            photos_count = len(media_groups[group_id]['photos'])
+            
+            # Если это первое фото, запускаем таймер
+            if not media_groups[group_id]['timer_started']:
+                media_groups[group_id]['timer_started'] = True
+                
+                timer = threading.Timer(2.0, process_media_group, args=[group_id])
+                timer.start()
+                
+                # Отправляем подтверждение
+                msg = bot.reply_to(message, f"📸 Получено фото 1. Ожидание остальных...")
+                media_groups[group_id]['message'] = msg
+            else:
+                # Обновляем сообщение о количестве полученных фото
+                if media_groups[group_id]['message']:
+                    try:
+                        bot.edit_message_text(
+                            f"📸 Получено фото {photos_count}. Ожидание остальных...",
+                            chat_id=message.chat.id,
+                            message_id=media_groups[group_id]['message'].message_id
+                        )
+                    except:
+                        pass  # Игнорируем ошибки редактирования
+        else:
+            # Одиночное фото - обрабатываем как обычно
+            process_single_photo(message)
+            
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка: {str(e)}")
+        print(f"Ошибка в handle_photo: {e}")
+        import traceback
+        traceback.print_exc()
+
+def process_media_group(group_id):
+    """Обрабатывает все фото из медиа-группы"""
+    try:
+        if group_id not in media_groups:
             return
         
+        group_data = media_groups[group_id]
+        
+        # Проверяем, не обрабатывается ли уже эта группа
+        if group_data['processing']:
+            return
+        
+        group_data['processing'] = True
+        photos = group_data['photos']
+        chat_id = group_data['chat_id']
+        status_msg = group_data['message']
+        
+        # Обновляем статус
+        if status_msg:
+            try:
+                bot.edit_message_text(
+                    f"🔄 Обрабатываю {len(photos)} фото...",
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id
+                )
+            except:
+                pass
+        
+        # Список для всех имен с каждого фото
+        all_names = []
+        photos_processed = 0
+        photos_failed = 0
+        
+        for i, photo_msg in enumerate(photos, 1):
+            try:
+                # Обновляем статус
+                if status_msg:
+                    try:
+                        bot.edit_message_text(
+                            f"🔄 Обрабатываю фото {i}/{len(photos)}...",
+                            chat_id=chat_id,
+                            message_id=status_msg.message_id
+                        )
+                    except:
+                        pass
+                
+                # Получаем фото
+                file_info = bot.get_file(photo_msg.photo[-1].file_id)
+                downloaded_file = bot.download_file(file_info.file_path)
+                
+                # Сохраняем
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                photo_path = f"temp/photo_{timestamp}_{i}.jpg"
+                
+                with open(photo_path, 'wb') as new_file:
+                    new_file.write(downloaded_file)
+                
+                # Извлекаем имена
+                names = extract_names_from_image(photo_path)
+                
+                # Удаляем фото
+                try:
+                    os.remove(photo_path)
+                except:
+                    pass
+                
+                if names:
+                    all_names.extend(names)
+                    photos_processed += 1
+                    print(f"Фото {i}: найдено {len(names)} имен: {names}")
+                else:
+                    photos_failed += 1
+                    print(f"Фото {i}: имен не найдено")
+                    
+            except Exception as e:
+                photos_failed += 1
+                print(f"Ошибка при обработке фото {i}: {e}")
+        
+        if not all_names:
+            if status_msg:
+                try:
+                    bot.edit_message_text(
+                        f"❌ Не удалось найти имена ни на одном из {len(photos)} фото",
+                        chat_id=chat_id,
+                        message_id=status_msg.message_id
+                    )
+                except:
+                    pass
+            return
+        
+        # Показываем что нашли
+        unique_names = list(set(all_names))  # Временная уникализация для предпросмотра
+        names_text = "\n".join([f"• {name}" for name in unique_names[:10]])
+        if len(unique_names) > 10:
+            names_text += f"\n• ... и еще {len(unique_names) - 10}"
+        
+        if status_msg:
+            try:
+                bot.edit_message_text(
+                    f"✅ Найдено всего: {len(unique_names)} имен с {photos_processed} фото\n"
+                    f"❌ Без имен: {photos_failed} фото\n\n"
+                    f"{names_text}\n\n📝 Добавляю в Excel...",
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id
+                )
+            except:
+                pass
+        
+        # Добавляем в Excel
+        added_count, today_date = add_names_to_excel(all_names)
+        
+        # Получаем обновленную статистику
+        total_days, total_names, unique_all_names = get_table_stats()
+        
+        if added_count == 0:
+            final_msg = f"ℹ️ За {today_date} все имена уже были добавлены ранее\n\n"
+        else:
+            final_msg = f"✅ Готово!\n\n📅 {today_date}\n➕ Новых: {added_count}\n🔄 Повторов: {len(all_names) - added_count}\n\n"
+        
+        final_msg += f"📊 Статистика:\n• Всего дней: {total_days}\n• Всего записей: {total_names}\n• Уникальных имен: {unique_all_names}"
+        
+        if status_msg:
+            try:
+                bot.edit_message_text(
+                    final_msg,
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id
+                )
+            except:
+                pass
+        
+        # Отправляем файл
+        with open(EXCEL_FILE, 'rb') as file:
+            bot.send_document(chat_id, file)
+        
+    except Exception as e:
+        print(f"Ошибка в process_media_group: {e}")
+        import traceback
+        traceback.print_exc()
+        if 'status_msg' in locals() and status_msg:
+            try:
+                bot.edit_message_text(
+                    f"❌ Ошибка при обработке группы: {str(e)}",
+                    chat_id=chat_id,
+                    message_id=status_msg.message_id
+                )
+            except:
+                pass
+    finally:
+        # Очищаем данные группы
+        if group_id in media_groups:
+            del media_groups[group_id]
+
+def process_single_photo(message):
+    """Обрабатывает одиночное фото"""
+    try:
         processing_msg = bot.reply_to(message, "🔄 Обрабатываю фото...")
         
         # Получаем фото
@@ -558,7 +1101,7 @@ def handle_photo(message):
             message_id=processing_msg.message_id
         )
         
-        # Добавляем в Excel (каждый день в новый столбец)
+        # Добавляем в Excel
         added_count, today_date = add_names_to_excel(names)
         
         # Получаем обновленную статистику
@@ -577,9 +1120,9 @@ def handle_photo(message):
         else:
             bot.edit_message_text(
                 f"✅ Готово!\n\n"
-                f"📅 {today_date} (столбец {chr(64 + total_days) if total_days <= 26 else 'XX'})\n"
-                f"➕ Новых за сегодня: {added_count}\n"
-                f"🔄 Повторов сегодня: {len(names) - added_count}\n\n"
+                f"📅 {today_date}\n"
+                f"➕ Новых: {added_count}\n"
+                f"🔄 Повторов: {len(names) - added_count}\n\n"
                 f"📊 Статистика:\n"
                 f"• Всего дней: {total_days}\n"
                 f"• Всего записей: {total_names}\n"
@@ -595,14 +1138,16 @@ def handle_photo(message):
         
     except Exception as e:
         bot.reply_to(message, f"❌ Ошибка: {str(e)}")
-        print(f"Ошибка в handle_photo: {e}")
+        print(f"Ошибка в process_single_photo: {e}")
         import traceback
         traceback.print_exc()
 
 if __name__ == '__main__':
     print("🚀 Бот запущен...")
     print(f"📁 Файл: {EXCEL_FILE}")
-    print(f"•  Сегодня ({datetime.now().strftime('%d.%m.%Y')})")
+    print(f"• Сегодня ({datetime.now().strftime('%d.%m.%Y')})")
+    print("📸 Поддержка нескольких фото в одном сообщении!")
+    print("📝 Фильтр: слова от 3 букв, цифры удаляются")
     print("💡 Для отладки используй /debug")
     print("   Для удаления дубликатов используй /remove_duplicates")
     bot.infinity_polling()

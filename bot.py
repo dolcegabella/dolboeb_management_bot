@@ -12,7 +12,7 @@ import re
 # Токен бота
 TOKEN = '8697524461:AAFs8il54OBoGjs8VnrvoQGkgplvxuYUDZ8'
 # Ключ OpenAI API (для Vision / chat completions)
-OPENAI_API_KEY = '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'
+OPENAI_API_KEY = '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'
 OPENAI_VISION_MODEL = 'gpt-4o'
 
 bot = telebot.TeleBot(TOKEN)

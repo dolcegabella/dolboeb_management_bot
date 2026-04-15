@@ -1,0 +1,9 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+temp/
+backups/
+ocr_models/
+_misnamed_gitignore_folder/

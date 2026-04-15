@@ -1,26 +1,26 @@
 import telebot
 import os
-import cv2
+import base64
+import json
 import pandas as pd
 from datetime import datetime
-import easyocr
+from openai import OpenAI
 import shutil
 import time
 import re
 
 # Токен бота
 TOKEN = '8697524461:AAFs8il54OBoGjs8VnrvoQGkgplvxuYUDZ8'
+# Ключ OpenAI API (для Vision / chat completions)
+OPENAI_API_KEY = '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'
+OPENAI_VISION_MODEL = 'gpt-4o'
+
 bot = telebot.TeleBot(TOKEN)
 
 # Создаем папки
 for folder in ['temp', 'backups']:
     if not os.path.exists(folder):
         os.makedirs(folder)
-
-# Инициализируем EasyOCR
-print("Загрузка моделей OCR...")
-reader = easyocr.Reader(['ru', 'en'], gpu=False)
-print("Готов к работе!")
 
 EXCEL_FILE = 'ебанаты (кроме кисули).xlsx'
 
@@ -93,113 +93,99 @@ def should_skip_line(line_text):
             return True
     return False
 
+def _strip_json_fence(text):
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+def _parse_gpt_names_json(raw):
+    raw = _strip_json_fence(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        print(f"Не удалось разобрать JSON от модели: {raw[:500]}")
+        return []
+    if isinstance(data, dict) and "names" in data:
+        data = data["names"]
+    if not isinstance(data, list):
+        return []
+    out = []
+    for item in data:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
+
+def _image_mime_for_path(path):
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+    }.get(ext, "image/jpeg")
+
 def extract_names_from_image(image_path):
     """
-    Извлекает текст с фото и разбивает на строки
+    Извлекает имена с фото через OpenAI Vision.
     """
-    # Читаем и увеличиваем изображение
-    img = cv2.imread(image_path)
-    scale_percent = 150
-    width = int(img.shape[1] * scale_percent / 100)
-    height = int(img.shape[0] * scale_percent / 100)
-    img = cv2.resize(img, (width, height), interpolation=cv2.INTER_CUBIC)
-    
-    # Конвертируем в серый
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # Временно сохраняем
-    temp_path = image_path.replace('.jpg', '_temp.jpg')
-    cv2.imwrite(temp_path, gray)
-    
-    # Распознаем текст
-    results = reader.readtext(temp_path, paragraph=False)
-    
-    # Удаляем временный файл
-    try:
-        os.remove(temp_path)
-    except:
-        pass
-    
-    if not results:
-        return []
-    
-    # Группируем по строкам на основе координат
-    words_with_pos = []
-    for (bbox, text, confidence) in results:
-        if confidence > 0.2:
-            # Получаем координаты центра
-            y_center = (bbox[0][1] + bbox[2][1]) / 2
-            x_center = (bbox[0][0] + bbox[1][0]) / 2
-            
-            # Очищаем текст
-            cleaned_text = clean_text(text)
-            
-            if cleaned_text and len(cleaned_text) >= 1:
-                words_with_pos.append({
-                    'text': cleaned_text,
-                    'y': y_center,
-                    'x': x_center
-                })
-    
-    if not words_with_pos:
-        return []
-    
-    # Сортируем по вертикали
-    words_with_pos.sort(key=lambda x: x['y'])
-    
-    # Группируем по строкам
-    lines = []
-    current_line = []
-    current_y = words_with_pos[0]['y']
-    y_threshold = 25  # Порог для определения одной строки
-    
-    for word in words_with_pos:
-        if abs(word['y'] - current_y) < y_threshold:
-            current_line.append(word)
-        else:
-            # Сортируем слова в строке по горизонтали
-            current_line.sort(key=lambda w: w['x'])
-            
-            # Собираем текст строки
-            line_words = [w['text'] for w in current_line]
-            line_text = ' '.join(line_words)
-            
-            # Очищаем от лишних пробелов
-            line_text = clean_text(line_text)
-            
-            lines.append(line_text)
-            current_line = [word]
-            current_y = word['y']
-    
-    # Добавляем последнюю строку
-    if current_line:
-        current_line.sort(key=lambda w: w['x'])
-        line_words = [w['text'] for w in current_line]
-        line_text = ' '.join(line_words)
-        line_text = clean_text(line_text)
-        lines.append(line_text)
-    
-    # Обрабатываем каждую строку
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Заполните OPENAI_API_KEY в начале bot.py")
+
+    with open(image_path, "rb") as f:
+        b64 = base64.standard_b64encode(f.read()).decode("ascii")
+
+    mime = _image_mime_for_path(image_path)
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model=OPENAI_VISION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "На изображении список людей (часто участники конференции или поиска). "
+                            "Извлеки полные имена или ФИО: одна строка — один человек. "
+                            "Не включай заголовки, кнопки интерфейса, служебный текст, URL, подписи вроде «участник». "
+                            "Верни строго JSON-массив строк в UTF-8, без пояснений до или после, "
+                            'например: ["Иван Петров","Мария Иванова"]. Если подходящих имён нет — [].'
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    },
+                ],
+            }
+        ],
+        max_tokens=4096,
+    )
+
+    raw = (response.choices[0].message.content or "").strip()
+    lines = _parse_gpt_names_json(raw)
+
     names = []
-    
     for line in lines:
-        # Проверяем, нужно ли пропустить строку
+        line = clean_text(line)
+        if not line:
+            continue
         if should_skip_line(line):
             continue
-        
-        # Делаем первую букву каждого слова заглавной
         formatted_line = capitalize_words(line)
-        
-        # Фильтруем короткие слова (удаляем слова <= 3 символов, оставляем минимум 4)
         formatted_line = filter_short_words(formatted_line)
-        
-        # Дополнительная очистка
         formatted_line = clean_text(formatted_line)
-        
-        # Добавляем только непустые строки
         if formatted_line and len(formatted_line) >= 2:
             names.append(formatted_line)
-    
+
     return names
 
 def add_names_to_excel(names_list):
@@ -432,7 +418,7 @@ def send_help(message):
     bot.reply_to(message,
         "🤖 Как работает бот:\n\n"
         "1. Отправляете фото со списком участников\n"
-        "2. Бот распознает текст\n"
+        "2. Бот отправляет фото в OpenAI (GPT-4 Vision) и получает список имён\n"
         "3. 🔥 ВАЖНО: удаляются слова короче 4 символов\n"
         "4. 📅 КАЖДЫЙ ДЕНЬ - НОВЫЙ СТОЛБЕЦ\n"
         "5. Внутри одного дня дубликаты НЕ добавляются\n\n"
@@ -525,8 +511,8 @@ def handle_photo(message):
             new_file.write(downloaded_file)
         
         bot.edit_message_text(
-            "🔍 Сканирую текст...", 
-            chat_id=message.chat.id, 
+            "🤖 Анализ изображения (GPT-4 Vision)...",
+            chat_id=message.chat.id,
             message_id=processing_msg.message_id
         )
         
@@ -601,6 +587,10 @@ def handle_photo(message):
 
 if __name__ == '__main__':
     print("🚀 Бот запущен...")
+    if not OPENAI_API_KEY:
+        print("⚠️  Пустой OPENAI_API_KEY в bot.py — обработка фото не будет работать.")
+    else:
+        print(f"🔑 OpenAI Vision: {OPENAI_VISION_MODEL}")
     print(f"📁 Файл: {EXCEL_FILE}")
     print(f"•  Сегодня ({datetime.now().strftime('%d.%m.%Y')})")
     print("💡 Для отладки используй /debug")

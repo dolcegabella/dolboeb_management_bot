@@ -11,11 +11,28 @@ import re
 
 # Токен бота
 TOKEN = '8697524461:AAFs8il54OBoGjs8VnrvoQGkgplvxuYUDZ8'
-# Ключ OpenAI API (для Vision / chat completions)
+# API-ключ: nvapi-... = NVIDIA NIM (build.nvidia.com), sk-... = OpenAI
 OPENAI_API_KEY = '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'
-OPENAI_VISION_MODEL = 'gpt-4o'
+# NVIDIA: OpenAI-совместимый хост и VLM с build.nvidia.com/models
+NVIDIA_API_BASE = "https://integrate.api.nvidia.com/v1"
+NVIDIA_VISION_MODEL = "meta/llama-3.2-11b-vision-instruct"
+# OpenAI (platform.openai.com): vision-модель при ключе sk-...
+OPENAI_VISION_MODEL = "gpt-4o"
 
 bot = telebot.TeleBot(TOKEN)
+
+
+def _llm_client():
+    """OpenAI SDK: тот же протокол, у NVIDIA другой base_url."""
+    if OPENAI_API_KEY.startswith("nvapi-"):
+        return OpenAI(base_url=NVIDIA_API_BASE, api_key=OPENAI_API_KEY)
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+
+def _vision_model_name():
+    if OPENAI_API_KEY.startswith("nvapi-"):
+        return NVIDIA_VISION_MODEL
+    return OPENAI_VISION_MODEL
 
 # Создаем папки
 for folder in ['temp', 'backups']:
@@ -133,7 +150,7 @@ def _image_mime_for_path(path):
 
 def extract_names_from_image(image_path):
     """
-    Извлекает имена с фото через OpenAI Vision.
+    Извлекает имена с фото: NVIDIA NIM (nvapi) или OpenAI (sk), см. build.nvidia.com/models.
     """
     if not OPENAI_API_KEY:
         raise RuntimeError("Заполните OPENAI_API_KEY в начале bot.py")
@@ -143,9 +160,9 @@ def extract_names_from_image(image_path):
 
     mime = _image_mime_for_path(image_path)
 
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = _llm_client()
     response = client.chat.completions.create(
-        model=OPENAI_VISION_MODEL,
+        model=_vision_model_name(),
         messages=[
             {
                 "role": "user",
@@ -418,7 +435,7 @@ def send_help(message):
     bot.reply_to(message,
         "🤖 Как работает бот:\n\n"
         "1. Отправляете фото со списком участников\n"
-        "2. Бот отправляет фото в OpenAI (GPT-4 Vision) и получает список имён\n"
+        "2. Бот отправляет фото в API (NVIDIA NIM или OpenAI) и получает список имён\n"
         "3. 🔥 ВАЖНО: удаляются слова короче 4 символов\n"
         "4. 📅 КАЖДЫЙ ДЕНЬ - НОВЫЙ СТОЛБЕЦ\n"
         "5. Внутри одного дня дубликаты НЕ добавляются\n\n"
@@ -511,7 +528,7 @@ def handle_photo(message):
             new_file.write(downloaded_file)
         
         bot.edit_message_text(
-            "🤖 Анализ изображения (GPT-4 Vision)...",
+            "🤖 Анализ изображения...",
             chat_id=message.chat.id,
             message_id=processing_msg.message_id
         )
@@ -590,7 +607,8 @@ if __name__ == '__main__':
     if not OPENAI_API_KEY:
         print("⚠️  Пустой OPENAI_API_KEY в bot.py — обработка фото не будет работать.")
     else:
-        print(f"🔑 OpenAI Vision: {OPENAI_VISION_MODEL}")
+        host = NVIDIA_API_BASE if OPENAI_API_KEY.startswith("nvapi-") else "api.openai.com"
+        print(f"🔑 Vision: {_vision_model_name()} @ {host}")
     print(f"📁 Файл: {EXCEL_FILE}")
     print(f"•  Сегодня ({datetime.now().strftime('%d.%m.%Y')})")
     print("💡 Для отладки используй /debug")
